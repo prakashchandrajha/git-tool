@@ -1,0 +1,10 @@
+{
+  "_readme": "Copy to policy.json to activate. Per-project overrides; unknown keys are an error. Delete keys you do not need.",
+  "ignored_dirs": "scan",
+  "protect": ["tests/invariants"],
+  "private_dirs_add": [],
+  "private_dirs_remove": ["database"],
+  "private_suffixes_add": [],
+  "private_suffixes_remove": [".csv"],
+  "generated_dirs_add": ["my_build_output"]
+}
