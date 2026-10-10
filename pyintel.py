@@ -1887,7 +1887,9 @@ def audit(world, cap=300, budget=25.0):
 
 _TAG = {"E-CALL": "CALL", "E-NAME": "NAME", "E-ATTR": "ATTR", "E-IMPORT": "IMPORT", "E-SYNTAX": "SYNTAX",
         "E-GONE": "GONE", "L-UNDEF": "UNDEF", "P-TOUCH": "TOUCH", "P-SECRET": "SECRET", "Q-TEST": "TEST",
-        "Q-SILENCE": "SILENCE", "Q-LEFTOVER": "LEFTOVER", "Q-DUP": "DUP"}
+        "Q-SILENCE": "SILENCE", "Q-LEFTOVER": "LEFTOVER", "Q-DUP": "DUP",
+        "P-REVERT": "REVERT", "P-UNFIX": "UNFIX", "P-GUARD": "GUARD",
+        "W-REGRESSION": "REGRESSION", "W-COUNT": "COUNT", "W-SILENT": "SILENT"}
 
 
 def finding_line(f, tag):
@@ -1933,6 +1935,18 @@ def render_review(res, task=None, limit=12, runner="agent.py"):
             L.append("  " + finding_line(f, f"Q{i}"))
         if len(res["smells"]) > 8:
             L.append(f"  (+{len(res['smells']) - 8} more)")
+    if res.get("history"):
+        L.append(f"HISTORY ({len(res['history'])}) - from git history: evidence to check, NOT a verdict "
+                 "(measured flag rate on 480 already-merged upstream commits: about 1 in 10, so read the commit "
+                 "before believing it)")
+        for i, f in enumerate(res["history"][:4], 1):
+            L.append("  " + finding_line(f, f"H{i}"))
+        if len(res["history"]) > 4:
+            L.append(f"  (+{len(res['history']) - 4} more)")
+    if res.get("warnings"):
+        L.append(f"WARNINGS ({len(res['warnings'])}) - compare with the recorded baseline before trusting a green run")
+        for i, f in enumerate(res["warnings"][:4], 1):
+            L.append("  " + finding_line(f, f"W{i}"))
     if res["possible"]:
         L.append(f"POSSIBLE ({len(res['possible'])}) - name matches, cannot be proved; check by hand")
         for p in res["possible"][:6]:

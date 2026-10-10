@@ -9,6 +9,7 @@ Exit code 0 = every check passed.  Run it once after pasting the folder into a n
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+import checkdiff
 
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
@@ -75,7 +78,10 @@ class Repo:
             git(self.root, "commit", "-qm", "init")
         if toolkit:
             dest = self.root / "agentussagefolder"
-            shutil.copytree(HERE, dest, ignore=shutil.ignore_patterns(".state", "__pycache__", "policy.json"))
+            # When the toolkit is developed from a checkout, do not accidentally copy that
+            # checkout's .git directory into the throwaway project: Git then records it as an
+            # embedded repository/submodule rather than testing a normal tracked toolkit.
+            shutil.copytree(HERE, dest, ignore=shutil.ignore_patterns(".state", "__pycache__", "policy.json", ".git"))
             if commit_toolkit:
                 git(self.root, "add", "-A")
                 git(self.root, "commit", "-qm", "toolkit")
@@ -363,6 +369,76 @@ def red_baseline_is_not_blamed_on_the_agent():
     mutator = json.dumps(["python3", "-c", "open('stray.txt','w').write('x')"])
     code, d = r.js("begin", "--task", "mut", "--check", mutator, "--run-baseline", "app.py")
     check("a check that writes files is rejected up front", d.get("state") == "BLOCKED" and "modified the worktree" in json.dumps(d), d)
+    r.cleanup()
+
+
+@scenario
+def baseline_comparison_catches_silent_test_loss():
+    """A green command is unsafe when it now discovers zero tests it used to run."""
+    files = dict(FILES)
+    files["app.py"] = "MODE = 'covered'\n"
+    files["check_count.py"] = (
+        "from pathlib import Path\n"
+        "covered = \"covered\" in Path('app.py').read_text()\n"
+        "print('Ran 2 tests in 0.001s' if covered else 'Ran 0 tests in 0.001s')\n"
+        "print('OK')\n"
+    )
+    r = Repo(files=files)
+    command = json.dumps(["python3", "check_count.py"])
+    code, d = r.js("begin", "--task", "silent", "--check", command, "--run-baseline", "app.py")
+    check("baseline records a test-producing command", d.get("baseline") == "all declared checks were green before you started", d)
+    r.sub("app.py", "covered", "empty")
+    code, d = r.js("verify", "--task", "silent")
+    warnings = d.get("baseline_warnings", [])
+    check("zero-test collapse blocks a green command", d.get("state") == "BLOCKED" and
+          any(x.get("code") == "W-SILENT" for x in warnings), d)
+    r.cleanup()
+
+
+@scenario
+def check_summary_parsers_are_conservative_and_cover_jest():
+    check("jest summary parses", checkdiff.parse_counts("Tests: 2 passed, 2 total")[0] ==
+          {"passed": 2, "failed": 0, "errors": 0, "skipped": 0, "total": 2, "engine": "jest"})
+    codes = {f["code"] for f in checkdiff.compare("Tests: 2 passed, 2 total", "Tests: 1 passed, 1 total")}
+    check("jest count regression is evidence", "W-COUNT" in codes)
+    check("unknown check output produces no invented warning", checkdiff.compare("all fine", "still fine") == [])
+
+
+@scenario
+def history_revert_and_memory_are_evidence_not_guesses():
+    """Exercise the new history and durable-memory paths against a real temporary Git history."""
+    files = dict(FILES)
+    files["app.py"] = (
+        "def validate_order(order, limits):\n"
+        "    return order <= limits\n\n\n"
+        "def execute(order, limits):\n"
+        "    return order\n"
+    )
+    r = Repo(files=files)
+    r.write("app.py", r.read("app.py").replace("    return order\n", "    return validate_order(order, limits)\n"))
+    git(r.root, "add", "app.py")
+    git(r.root, "commit", "-qm", "fix: validate orders before execution")
+    fixed = git(r.root, "rev-parse", "HEAD").strip()
+    r.write("app.py", r.read("app.py").replace("    return validate_order(order, limits)\n", "    return order\n"))
+    git(r.root, "add", "app.py")
+    git(r.root, "commit", "-qm", 'Revert "fix: validate orders before execution"',
+        "-m", "This reverts commit " + fixed + ".")
+    # This uncommitted edit is an agent attempt to put back exactly what the revert removed.
+    r.write("app.py", r.read("app.py").replace("    return order\n", "    return validate_order(order, limits)\n"))
+    code, out, _ = r.run("review")
+    check("re-adding reverted behaviour is cited with its commit", "HISTORY (" in out and "[REVERT]" in out, out)
+    code, out, _ = r.run("history", "app.py")
+    check("history report proves the revert relationship", code == 0 and "REVERT" in out and fixed[:8] in out, out)
+    sha = hashlib.sha256(r.read("pkg/risk.py").encode()).hexdigest()
+    evidence = json.dumps([{"type": "file", "path": "pkg/risk.py", "sha256": sha}])
+    code, d = r.js("memory", "remember", "--kind", "invariant", "--key", "risk", "--text",
+                   "Risk sizing remains bounded by max_notional_usd.", "--evidence", evidence,
+                   "--confidence", "proved", "--tag", "risk")
+    check("memory stores fresh evidence-backed fact", d.get("state") == "REMEMBERED" and
+          d.get("fact", {}).get("checked", {}).get("result") == "fresh", d)
+    r.sub("pkg/risk.py", "return x * 2", "return x * 3")
+    code, d = r.js("memory", "recall", "--tag", "risk", "--fresh")
+    check("stale memory is not returned as current knowledge", d.get("facts") == [] and d.get("stats", {}).get("stale") == 1, d)
     r.cleanup()
 
 

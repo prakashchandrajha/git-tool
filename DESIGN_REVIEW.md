@@ -131,7 +131,7 @@ Never used: `branch`, `commit`, `stash`, `reset`, `checkout`, `worktree`, `add`.
 
 ## 5. Evidence
 
-**Self-test:** 114 checks in 21 scenarios, about 20 seconds (`python3 agentussagefolder/selftest.py`).
+**Self-test:** 120 checks in 23 scenarios, about 25 seconds (`python3 agentussagefolder/selftest.py`).
 
 **Real code, not just my fixtures.** I ran the whole-repo audit on 7 open-source projects (3,477 Python files: requests, click, flask, jinja, httpx, rich, django). The first pass found real flaws in my own checker, all fixed:
 
@@ -209,6 +209,9 @@ It fails open on any error, and blocks only paths outside every open task's scop
 | `SKILL.md` | Rewritten; sizes the ceremony to the task and adds the do-not-distort rules. |
 | `selftest.py`, `policy.example.json` (new) | Verification and per-project tuning. |
 | `pyintel.py` / `agent.py` (v2.1) | Quality signals (tests weakened, skips, suppressions, swallowed exceptions, debug leftovers, unused imports, duplicates), secret detection, `GATES` discovery, `begin --run-baseline`, config/docs/template word hits. See section 9. |
+| `gitmem.py` / `agent.py` (v2.2) | Bounded, cached history evidence: explicit revert chains, follow-up-fix patterns, co-change, regression-test guards, `history`, and review findings that cite prior fix/revert commits without pretending they are verdicts. |
+| `checkdiff.py` / `agent.py` (v2.2) | Compares each declared check only with its own pre-edit output. A recognized test runner dropping from tests to zero tests blocks a green verification; smaller count drops are evidence warnings. |
+| `memory.py` / `agent.py` (v2.2) | Per-repository HMAC-signed fact ledger with explicit evidence, contradiction retention, and file/commit/test staleness checks for agent handoffs and context resets. |
 | `check_vault.sh`, `git_logical_coupling.sh`, `.gitignore` | Unchanged. |
 | `semantic_airlock.py` | Untouched; keep your copy. |
 

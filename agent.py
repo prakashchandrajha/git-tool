@@ -42,7 +42,7 @@ try:  # POSIX
 except ImportError:  # Windows
     fcntl = None
 
-VERSION = "2.0"
+VERSION = "2.2"
 IS_WIN = os.name == "nt"
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -53,6 +53,7 @@ TOOLKIT = Path(__file__).resolve().parent
 STATE = TOOLKIT / ".state"
 BLOBS = STATE / "blobs"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+MEMORY_NAME = re.compile(r"memory\.[0-9a-f]{16}\.json\Z")
 PRUNE = {".venv", ".venv_test", "venv", "env", "node_modules", "build", "dist",
          "target", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
          ".tox", ".nox", "coverage", ".cache", "htmlcov"}
@@ -594,7 +595,8 @@ def state_guard(key, lock_fd):
             continue
         if not path.is_file():
             raise Blocked(f"unsupported runtime state entry: {path.name}")
-        if path.name in {".key", ".lock"} or path.name.startswith((".write-", ".tmp-")):
+        if (path.name in {".key", ".lock"} or path.name.startswith((".write-", ".tmp-", ".mem-"))
+                or MEMORY_NAME.fullmatch(path.name)):
             continue
         if not re.fullmatch(r"task\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.json", path.name):
             raise Blocked(f"unexpected runtime state entry: {path.name}")
@@ -801,6 +803,81 @@ def build_world(root, budget=10.0):
                              budget=budget, cache_dir=STATE / "cache")
 
 
+def memory_file(root):
+    """A separate signed memory ledger per repository, kept with the toolkit state.
+
+    The filename deliberately contains only a stable digest of the absolute Git root.  This lets
+    one installed toolkit serve many repositories without leaking facts from one into another or
+    requiring the target project to track a private state file.
+    """
+    return STATE / ("memory." + digest({"root": str(root)})[:16] + ".json")
+
+
+def open_memory(root, key):
+    module = load_module("memory")
+    return module.Memory.open(root, key, path=memory_file(root))
+
+
+def _memory_evidence(raw):
+    """Parse deliberately small, structured evidence supplied by an agent.
+
+    Memory is a knowledge ledger, not a place for command output or secrets.  The memory module
+    re-checks recognized evidence types; this boundary constrains what enters the signed store.
+    """
+    if raw is None:
+        return []
+    try:
+        items = json.loads(raw)
+    except ValueError as exc:
+        raise Blocked("--evidence must be a JSON array of evidence objects") from exc
+    if not isinstance(items, list) or len(items) > 8 or not all(isinstance(item, dict) for item in items):
+        raise Blocked("--evidence must be a JSON array containing at most 8 objects")
+    allowed = {"commit", "file", "test", "command"}
+    out = []
+    for item in items:
+        kind = item.get("type")
+        if kind not in allowed:
+            raise Blocked("evidence type must be one of: " + ", ".join(sorted(allowed)))
+        # Bound recursive/untrusted JSON before it is signed and persisted.  The memory verifier
+        # intentionally treats command evidence as historical, never as fresh proof.
+        if len(canonical(item)) > 2400:
+            raise Blocked("one evidence object is too large")
+        out.append(item)
+    return out
+
+
+def _history_findings(root, changes, weakened, is_test):
+    """Attach evidence-only history findings to a review result.
+
+    These findings are never merged into static errors: matching a reverted/fixed line proves a
+    relationship to an earlier decision, not that the current change is wrong.  It is surfaced
+    prominently so an agent must read the cited commit before deciding to proceed.
+    """
+    if not changes:
+        return [], []
+    try:
+        history = load_module("gitmem").History.load(root, cache_dir=STATE / "cache")
+        findings = history.conflicts(changes, is_test=is_test)
+        findings += history.guard_findings(changes, is_test, weakened)
+        notes = list(history.notes)
+        if history.truncated:
+            notes.append("history mining reached its commit cap; older evidence was not considered")
+        return findings[:8], notes[:4]
+    except Exception as exc:  # noqa: BLE001 - history must never turn an analysis failure into a pass or crash
+        if os.environ.get("AGENT_DEBUG"):
+            raise
+        return [], [f"history intelligence unavailable ({type(exc).__name__}: {str(exc)[:100]})"]
+
+
+def add_history_intelligence(result, root, changes, intel):
+    """Mutate a normal static-review result with bounded, cited Git-history evidence."""
+    findings, notes = _history_findings(root, changes, result.get("smells") or [], intel.is_test_path)
+    result["history"] = findings
+    if notes:
+        result.setdefault("notes", []).extend(notes)
+    return result
+
+
 def baseline_bytes(root, plan, rel):
     """Content of ``rel`` at ``begin`` time -> (bytes|None, how)."""
     base = plan["baseline"]
@@ -857,14 +934,16 @@ def static_gate(plan, project, root):
         changes = collect_changes(root, project, plan)
         world = build_world(root)
         scope = plan["scope"]
-        return intel.review(world, changes, touch=plan.get("touch") or [],
-                            in_scope=lambda rel: any(contains(s, rel) for s in scope))
+        result = intel.review(world, changes, touch=plan.get("touch") or [],
+                              in_scope=lambda rel: any(contains(s, rel) for s in scope))
+        return add_history_intelligence(result, root, changes, intel)
     except Blocked:
         raise
     except Exception as exc:  # noqa: BLE001 - an analyzer bug must never masquerade as a pass
         if os.environ.get("AGENT_DEBUG"):
             raise
         return {"files": [], "errors": [], "likely": [], "possible": [], "policy": [], "tests": [], "untested": [],
+                "smells": [], "history": [], "warnings": [],
                 "notes": [f"static analysis unavailable ({type(exc).__name__}: {str(exc)[:100]}) - NOT a pass"],
                 "partial": 0}
 
@@ -948,11 +1027,41 @@ def run_baseline(checks, project, root, env, timeout):
     before, runs = snapshot(root), []
     for argv in checks:
         result = run_check(argv, project, env, timeout)
-        tail = "\n".join(x for x in (result["stdout"]["tail"].rstrip(), result["stderr"]["tail"].rstrip()) if x)
-        runs.append({"argv": argv, "exit": result["exit_code"], "timed_out": result["timed_out"], "tail": tail[-600:]})
+        output_tail = "\n".join(x for x in (result["stdout"]["tail"].rstrip(), result["stderr"]["tail"].rstrip()) if x)
+        # Keep enough of the exact same command's terminal output to compare framework
+        # summaries later.  This is bounded by run_check's tail cap and is not a claimed test
+        # result; unparseable output simply produces no inference.
+        runs.append({"argv": argv, "exit": result["exit_code"], "timed_out": result["timed_out"],
+                     "tail": output_tail[-600:], "summary": output_tail[-TAIL:]})
     if snapshot(root) != before:
         raise Blocked("a check modified the worktree during the baseline run; make the check read-only first")
     return runs
+
+
+def baseline_deltas(plan, runs):
+    """Evidence-only comparison of a declared check with its own pre-edit output.
+
+    A command can pass after its test selection silently shrinks.  ``checkdiff`` parses only
+    well-known summaries and returns no result for any ambiguous output.  A zero-test collapse is
+    treated as a verification failure; lesser count changes remain warnings because a task may
+    legitimately replace or retire tests.
+    """
+    previous = {json.dumps(row.get("argv")): row for row in plan.get("baseline_run") or []}
+    if not previous:
+        return []
+    compare = load_module("checkdiff").compare
+    warnings = []
+    for run in runs:
+        base = previous.get(json.dumps(run.get("argv")))
+        if not base:
+            continue
+        old_text = base.get("summary") or base.get("tail") or ""
+        new_text = "\n".join(x for x in (run.get("stdout", {}).get("tail", "").rstrip(),
+                                          run.get("stderr", {}).get("tail", "").rstrip()) if x)
+        for finding in compare(old_text, new_text):
+            finding["argv"] = run.get("argv")
+            warnings.append(finding)
+    return warnings
 
 
 def begin(args, project, root, key):
@@ -1150,16 +1259,30 @@ def verify(args, plan, project, root, key, lock_fd):
             break
     if len(last["runs"]) != len(plan["checks"]):
         last["reasons"].append("not all planned checks completed")
+    # Compare only a command with exactly itself, and only when the agent explicitly recorded a
+    # pre-edit baseline.  This catches the particularly dangerous case where discovery falls to
+    # zero while the command still exits 0.  Other deltas are surfaced as evidence, not guessed
+    # failures: deleting/replacing a test can be intentional.
+    last["baseline_warnings"] = baseline_deltas(plan, last["runs"])
+    if any(f.get("code") == "W-SILENT" for f in last["baseline_warnings"]):
+        last["reasons"].append("baseline comparison: a declared check ran zero tests after it previously ran tests")
     last["state"] = "BLOCKED" if last["reasons"] else "CHECKS_PASSED"
     state_guard(key, lock_fd)
     save(path, plan, key)
     result = status(args.task, plan, snapshot(root), identity(project, plan["checks"], env))
+    if last.get("baseline_warnings"):
+        # Keep structured, command-specific proof in the receipt output even when a zero-test
+        # collapse turns verification into BLOCKED.
+        result["baseline_warnings"] = last["baseline_warnings"]
     if result["state"] == "BLOCKED":
         info = failure_info(last, plan)
         if info:
             result["failure"] = info
     elif result["state"] == "CHECKS_PASSED" and static:
         warn = []
+        for finding in last.get("baseline_warnings") or []:
+            if finding.get("code") != "W-SILENT":
+                warn.append(f"{finding.get('code')}: {finding.get('msg')}")
         if static["untested"]:
             warn.append("UNTESTED (no test imports them; a green run says nothing about): " + ", ".join(static["untested"][:4]))
         if static["possible"]:
@@ -1168,6 +1291,9 @@ def verify(args, plan, project, root, key, lock_fd):
         if smells:
             warn.append(f"{len(smells)} SMELL(S) - fix or justify in your summary: " +
                         "; ".join(f"[{x['code'][2:]}] {x['path']}: {x['msg']}" for x in smells[:3]))
+        history = static.get("history") or []
+        if history:
+            warn.append(f"{len(history)} HISTORY finding(s) cite prior fixes/reverts; read the cited commit before claiming this is safe")
         warn += static["notes"]
         if warn:
             result["warn"] = warn
@@ -1284,8 +1410,12 @@ def output(value, pretty=False):
 
 
 def _runner(project):
-    rel = os.path.relpath(TOOLKIT / "agent.py", project).replace(os.sep, "/")
-    return f"python3 {rel}"
+    target = TOOLKIT / "agent.py"
+    rel = os.path.relpath(target, project).replace(os.sep, "/")
+    # A relative path is concise for a copied-in toolkit.  For a centrally installed toolkit
+    # serving another checkout, an absolute path is less surprising and cannot be misread as a
+    # repository path in the agent's next command.
+    return f"python3 {target}" if rel == ".." or rel.startswith("../") else f"python3 {rel}"
 
 
 def _locate_all(world, project, root, specs):
@@ -1383,6 +1513,7 @@ def cmd_review(args, project, root, plan=None):
     scope = plan["scope"] if plan else None
     res = intel.review(world, changes, touch=(plan or {}).get("touch") or [],
                        in_scope=(lambda rel: any(contains(s, rel) for s in scope)) if scope else None)
+    add_history_intelligence(res, root, changes, intel)
     bad = len(res["errors"]) + len(res["likely"]) + len(res["policy"])
     outside = sorted({f["path"] for f in res["errors"] + res["likely"]
                       if scope and not any(contains(s, f["path"]) for s in scope)})
@@ -1433,6 +1564,60 @@ def cmd_diff(args, project, root, plan=None):
     head = (f"diff  agent changes since begin ({args.task})" if plan else "diff  worktree vs HEAD") + \
            f"  {len(changes)} file(s) +{adds}/-{dels}"
     return head + ("\n" + "\n".join(lines) if lines else "\n(no changes)"), 0
+
+
+def cmd_history(args, project, root):
+    """Read bounded Git evidence for a path or a precise line range, never a risk score."""
+    intel, gitmem = load_module("pyintel"), load_module("gitmem")
+    world = build_world(root)
+    targets, notes = _locate_all(world, project, root, args.paths)
+    if not targets:
+        raise Blocked("; ".join(notes) or "no valid target")
+    if args.lines and len(targets) != 1:
+        raise Blocked("--lines needs exactly one file")
+    history = gitmem.History.load(root, limit=args.commits, cache_dir=STATE / "cache")
+    if args.lines:
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", args.lines)
+        if not match:
+            raise Blocked("--lines must be LINE or START-END")
+        start, end = int(match.group(1)), int(match.group(2) or match.group(1))
+        if start < 1 or end < start:
+            raise Blocked("--lines must be a positive ascending range")
+        blamed, error = history.blame(targets[0], start, end)
+        if error:
+            raise Blocked(error)
+        text = gitmem.render_why(blamed, f":{start}-{end}", args.limit)
+    else:
+        records = [history.report(path, intel.is_test_path, args.limit) for path in targets]
+        text = gitmem.render_history(records, len(history.commits), args.limit, history.head)
+    extras = notes + history.notes
+    if history.truncated:
+        extras.append("history window is truncated; older commits were not considered")
+    return text + "".join("\nNOTE: " + item for item in extras[:6]), 0
+
+
+def cmd_memory(args, project, root, key):
+    """Maintain a per-repository, signed evidence ledger for context resets and handoffs."""
+    memory = open_memory(root, key)
+    action = args.memory_action
+    if action == "remember":
+        evidence = _memory_evidence(args.evidence)
+        result = memory.remember(args.kind, args.fact_key, args.text, evidence=evidence,
+                                 confidence=args.confidence, tags=args.tag, actor=args.actor,
+                                 task=args.fact_task)
+        memory.save()
+        fact = dict(result["fact"])
+        fact["checked"] = memory._check(fact)
+        return report("memory", "REMEMBERED", memory.notes, duplicate=result["duplicate"], fact=fact)
+    if action == "forget":
+        result = memory.forget(args.fact_id, args.reason, args.actor)
+        memory.save()
+        return report("memory", "FORGOTTEN", memory.notes, fact=result["fact"], already=result["already"])
+    if action == "recall":
+        rows = memory.recall(tags=args.tag, kinds=args.kind, query=args.query, key=args.fact_key,
+                             limit=args.limit, include_stale=not args.fresh)
+        return report("memory", "READY", memory.notes, facts=rows, stats=memory.stats())
+    return report("memory", "READY", memory.notes, stats=memory.stats())
 
 
 def cmd_guard(args):
@@ -1597,6 +1782,13 @@ def build_parser():
     br.add_argument("--json", action="store_true")
     br.add_argument("paths", nargs="+")
 
+    hist = subs.add_parser("history", help="Git evidence: prior fixes, reverts, guards and coupling for paths")
+    hist.add_argument("--project", type=Path)
+    hist.add_argument("--lines", help="explain why one line or START-END exists (uses git blame)")
+    hist.add_argument("--commits", type=int, default=3000, help="bounded history window (50-40000)")
+    hist.add_argument("--limit", type=int, default=6)
+    hist.add_argument("paths", nargs="+")
+
     o = subs.add_parser("outline", help="symbols with line ranges and signatures (read less)")
     o.add_argument("--project", type=Path)
     o.add_argument("--all", action="store_true")
@@ -1614,6 +1806,31 @@ def build_parser():
     g.add_argument("--hook", action="store_true", help="read a Claude Code PreToolUse JSON payload on stdin")
     g.add_argument("--require-task", action="store_true")
     g.add_argument("paths", nargs="*")
+
+    mem = subs.add_parser("memory", help="signed, evidence-backed repository knowledge across agent sessions")
+    mem.add_argument("--project", type=Path)
+    memsubs = mem.add_subparsers(dest="memory_action", required=True)
+    ms = memsubs.add_parser("status", help="show ledger health and stale-fact count")
+    mr = memsubs.add_parser("recall", help="recall facts; every recognized evidence item is re-checked")
+    mr.add_argument("--tag", action="append", default=[])
+    mr.add_argument("--kind", action="append", default=[])
+    mr.add_argument("--key", dest="fact_key")
+    mr.add_argument("--query")
+    mr.add_argument("--limit", type=int, default=8)
+    mr.add_argument("--fresh", action="store_true", help="hide stale facts instead of treating them as current")
+    mw = memsubs.add_parser("remember", help="write one bounded fact with explicit evidence/confidence")
+    mw.add_argument("--kind", required=True)
+    mw.add_argument("--key", dest="fact_key", default="")
+    mw.add_argument("--text", required=True)
+    mw.add_argument("--evidence", help="JSON evidence array: commit/file/test/command objects")
+    mw.add_argument("--confidence", choices=("proved", "reported", "hypothesis"), default="reported")
+    mw.add_argument("--tag", action="append", default=[])
+    mw.add_argument("--actor", default="agent")
+    mw.add_argument("--task", dest="fact_task")
+    mf = memsubs.add_parser("forget", help="supersede a fact without deleting its audit trail")
+    mf.add_argument("fact_id")
+    mf.add_argument("--reason", default="")
+    mf.add_argument("--actor", default="agent")
 
     listing = subs.add_parser("list", help="list local task receipts")
     listing.add_argument("--project", type=Path)
@@ -1635,7 +1852,7 @@ def build_parser():
     return parser
 
 
-TEXT_COMMANDS = {"brief", "outline", "slice", "review", "diff"}
+TEXT_COMMANDS = {"brief", "outline", "slice", "review", "diff", "history"}
 
 
 def main(argv=None):
@@ -1674,7 +1891,7 @@ def main(argv=None):
             if command == "review" and args.task and args.all:
                 raise Blocked("--all audits the whole repo; do not combine it with --task")
             handler = {"brief": cmd_brief, "outline": cmd_outline, "slice": cmd_slice,
-                       "review": cmd_review, "diff": cmd_diff}[command]
+                       "review": cmd_review, "diff": cmd_diff, "history": cmd_history}[command]
             payload, code = handler(args, project, root, plan) if command in {"review", "diff"} else handler(args, project, root)
             if isinstance(payload, str):
                 print(payload)
@@ -1688,23 +1905,27 @@ def main(argv=None):
                     raise Blocked("invalid task name")
                 project, root = project_and_root(args.project)
                 result = begin(args, project, root, key)
-            elif command in {"verify", "status", "close", "abandon", "restore", "widen"}:
-                _, plan = load_plan(args.task, key)
-                project, root = plan_project(plan, args.project)
-                if command == "verify":
-                    result = verify(args, plan, project, root, key, lock_fd)
-                elif command == "close":
-                    result = close_task(args, plan, project, root, key)
-                elif command == "abandon":
-                    result = abandon_task(args, plan, key)
-                elif command == "restore":
-                    result = restore_task(args, plan, project, root, key)
-                elif command == "widen":
-                    result = widen_task(args, plan, project, root, key)
+            elif command in {"verify", "status", "close", "abandon", "restore", "widen", "memory"}:
+                if command == "memory":
+                    project, root = project_and_root(args.project)
+                    result = cmd_memory(args, project, root, key)
                 else:
-                    current = snapshot(root)
-                    env_id = identity(project, plan["checks"], command_env(project))
-                    result = status(args.task, plan, current, env_id)
+                    _, plan = load_plan(args.task, key)
+                    project, root = plan_project(plan, args.project)
+                    if command == "verify":
+                        result = verify(args, plan, project, root, key, lock_fd)
+                    elif command == "close":
+                        result = close_task(args, plan, project, root, key)
+                    elif command == "abandon":
+                        result = abandon_task(args, plan, key)
+                    elif command == "restore":
+                        result = restore_task(args, plan, project, root, key)
+                    elif command == "widen":
+                        result = widen_task(args, plan, project, root, key)
+                    else:
+                        current = snapshot(root)
+                        env_id = identity(project, plan["checks"], command_env(project))
+                        result = status(args.task, plan, current, env_id)
             else:  # list
                 project, root = project_and_root(args.project)
                 rows = []
