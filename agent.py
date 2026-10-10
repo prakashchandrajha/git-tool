@@ -471,6 +471,7 @@ HINTS = (
     ("initial HEAD/ref/index changed", "git state moved (commit/checkout/stage); agent.py abandon --task {t}, begin again"),
     ("unsupported/private/runtime delta", "a private/runtime file changed; agent.py restore --task {t} {p}; never edit data/logs/.env"),
     ("unresolved unknown claims", "resolve the --unknown claim(s), then begin again"),
+    ("proof debt:", "run `agent.py proof --task {t}`; add/select the cited test, then abandon and begin again if the check set must change"),
     ("check failed", "read `failure`, fix the cause, rerun verify"),
     ("check changed watched files", "the check modified files; make it read-only or use temp dirs"),
     ("static:", "agent.py review --task {t}; fix the findings; rerun verify"),
@@ -878,6 +879,49 @@ def add_history_intelligence(result, root, changes, intel):
     return result
 
 
+def _proof_sources(plan, root, project, changes, world, intel):
+    """Turn changed/scoped source paths into test and Git-history evidence candidates."""
+    changed = [row["path"] for row in (changes or []) if not row.get("opaque") and not intel.is_test_path(row["path"])
+               and Path(row["path"]).suffix.lower() in SOURCE_SUFFIXES]
+    # `proof --task` before an edit is still useful: assess the intended scope.  During verify,
+    # use only source files that actually changed so an untouched neighbour cannot create debt.
+    if not changed:
+        changed = [rel for rel in world.files if Path(rel).suffix.lower() in SOURCE_SUFFIXES
+                   and not intel.is_test_path(rel) and any(contains(scope, rel) for scope in plan["scope"])]
+    changed = sorted(set(changed))[:80]
+    history = None
+    history_notes = []
+    try:
+        history = load_module("gitmem").History.load(root, cache_dir=STATE / "cache")
+        history_notes = list(history.notes)
+    except Exception as exc:  # noqa: BLE001 - insufficient history is an unknown, not a crash
+        history_notes = [f"history guards unavailable ({type(exc).__name__})"]
+    sources = []
+    for rel in changed:
+        tests = []
+        for test, (_depth, _via) in world.tests_for([rel]):
+            tests.append({"path": test, "project_path": os.path.relpath(root / test, project).replace(os.sep, "/")})
+        guards = []
+        if history is not None:
+            for guard_row in history.guards(rel, intel.is_test_path, cap=8):
+                test = guard_row["path"]
+                guards.append({"path": test, "project_path": os.path.relpath(root / test, project).replace(os.sep, "/")})
+        sources.append({"path": rel, "python": rel.endswith((".py", ".pyi")), "tests": tests, "guards": guards})
+    return sources, history_notes
+
+
+def proof_matrix(plan, project, root, changes=None):
+    """Evidence matrix: changed code -> known tests/guards -> declared check selection."""
+    intel, proof = load_module("pyintel"), load_module("proof")
+    world = build_world(root)
+    sources, notes = _proof_sources(plan, root, project, changes, world, intel)
+    result = proof.assess(sources, plan["checks"])
+    result["notes"] = notes
+    if world.partial:
+        result["notes"].append(f"test graph is partial ({world.partial} source file(s) pending); proof is incomplete")
+    return result
+
+
 def baseline_bytes(root, plan, rel):
     """Content of ``rel`` at ``begin`` time -> (bytes|None, how)."""
     base = plan["baseline"]
@@ -1090,7 +1134,8 @@ def begin(args, project, root, key):
         raise Blocked("timeout must be between 1 and 3600 seconds")
     configuration = {"version": 1, "project": str(project), "root": str(root), "scope": scope,
                      "protect": protect, "checks": checks, "timeout": args.timeout,
-                     "unknown": sorted(set(args.unknown)), "touch": sorted(set(args.touch))}
+                     "unknown": sorted(set(args.unknown)), "touch": sorted(set(args.touch)),
+                     "require_proof": bool(args.require_proof)}
     path = STATE / f"task.{args.task}.json"
     env_id = identity(project, checks, command_env(project))
     baseline = snapshot(root)
