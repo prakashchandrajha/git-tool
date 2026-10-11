@@ -1,3 +1,0 @@
-# Runtime receipts and interpreter caches are local/private toolkit state.
-.state/
-__pycache__/

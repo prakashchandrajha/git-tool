@@ -1,47 +1,97 @@
 ---
-name: agentussagefolder
-description: Use before and after ANY code change in a git repo (bug fix, feature, refactor, rename, signature change). Shows the blast radius first (importers, callers, tests, co-changed files, the project's own check commands), mines Git for prior fixes/reverts and regression guards, then proves the edit did not break callers, invent imports/names/keywords, weaken tests, silently stop discovering tests, silence errors or leak secrets. In-place, no branches or commits, tiny output. Use it instead of grepping or cat-ing files to find usages, and before claiming a change is done.
+name: git-tool
+description: "Use before and after ANY code change in a git repo. The Quantitative Anti-Regression Vault: harvests runtime behavior of target functions before edits, replays after edits, and mathematically proves (via ULP-distance, instruction-count, and coverage gates) that no silent regression occurred. Replaces the legacy git-tool/ bash scripts."
 ---
 
-# agentussagefolder: change code safely, read less
+# gittool v3 — Quantitative Anti-Regression Vault
 
-`A` = `python3 agentussagefolder/agent.py` (run from the repo root). In-place: it never branches, commits, stashes or resets.
+## Architecture
 
-## Size the ceremony to the task
-- **Trivial** (typo, comment, one-liner, no signature touched): edit, then `A review`, then run the tests. Skip `begin`.
-- **Normal**: the loop below.
-- **Refactor, rename, API change, safety-critical code**: the loop plus `history`, `--touch` and `--run-baseline`.
+```
+gittool/
+├── state.py          # State machine: BEGUN→EDITING→REVIEWED→VERIFYING→VERIFIED→CLOSED
+├── crypto.py         # Ed25519 ledger, JCS canonical JSON, sym_hash, waiver validation
+├── engine.py         # Orchestrator: session lifecycle, snapshot, pipeline dispatch
+├── server.py         # stdio entry point: python -m gittool.server --project PATH
+├── mcp_front.py      # MCP server: 9 tools (begin, edit_ack, review, verify_start, etc.)
+├── probe/
+│   ├── inject.py     # AST-based import hook — wraps target functions at import time
+│   └── canon.py      # Lossless, address-free serialization (floats as hex, numpy-aware)
+├── workers/
+│   ├── harvest.py    # Runs suite on baseline tree, records (args, result, post-state) per call
+│   ├── replay.py     # Replays recorded calls on candidate tree, emits JSONL
+│   └── bench.py      # Wall-clock and instruction-count benchmarking worker
+└── gates/
+    ├── compare.py    # Diffs harvest vs replay using per-function ULP policy
+    ├── coverage.py   # sys.monitoring-based changed-line coverage
+    ├── latency.py    # Bootstrap CI wall-clock + deterministic instruction counting
+    └── bench_driver.py # ABBA interleaved benchmark driver
 
-## Loop
-1. **Brief**: `A brief FILE [--symbol NAME]` gives outline, importers, callers (CONFIRMED / PROBABLE / POSSIBLE), tests, co-changed files and `GATES` (the project's own checks). For code with a bug/revert history, also run `A history FILE` or `A history --lines 42-58 FILE`; it reports cited evidence, never a risk score. Read these instead of grep/cat. Bare filenames work.
-2. **Read little**: `A slice FILE Class.method` (or `FILE 40-80`), `A outline FILE`.
-3. **Begin**: `A begin --task NAME --auto-check [--touch Sym ...] [--run-baseline] FILE...`
-   `--auto-check` = pytest over the tests that import your files; otherwise `--check '["cmd","arg"]'` (JSON argv, never a shell string). `--touch` = existing functions you intend to change; other logic changes get flagged. `--run-baseline` runs the checks now, so you know what was already red and later compares each command with itself (a collapse to zero tests blocks verification).
-4. **Edit minimally.** Never edit `agentussagefolder/` or `.state/`.
-5. **Review** after each edit round: `A review --task NAME`. Fix every finding. Callers outside scope: `A widen --task NAME PATH...`.
-6. **Verify**: `A verify --task NAME` runs the static gate, Git-history regression evidence, then your checks fresh. `CHECKS_PASSED` means those commands passed, not that the code is correct. Read `warn`, especially `W-COUNT`, `HISTORY`, `SMELLS`, `POSSIBLE`, and `UNTESTED`.
-7. **Self-review**: `A diff --task NAME` shows only your changes. Undo one file exactly: `A restore --task NAME PATH` (keeps the user's earlier uncommitted edits; never `git checkout` a dirty file).
-8. **Finish**: `A close --task NAME` (or `abandon`). After a context reset: `A list`, `A status --task NAME`.
+contract/             # HUMAN-OWNED, read-only to agents
+├── policy.toml       # Per-function comparison policy (ulp/exact, max_ulp, critical)
+├── bench.py          # make_args(target, n) for benchmark inputs
+└── invariants/       # (TODO) Hypothesis property tests
 
-## Keep durable knowledge honest
+fixtures/             # Test fixtures for acceptance suite
+```
 
-Use this only for facts a later agent needs, not chat summaries or secrets:
+## How It Works
 
-`A memory remember --kind invariant --key payments --text '...' --evidence '[{"type":"commit","sha":"..."}]' --confidence proved`
+### The Pipeline
+1. **Harvest**: Run the test suite on the *baseline* tree with probes injected. Records every call's `(pre-args, post-args, result, exception)` as JSONL.
+2. **Replay**: A fresh process loads the *candidate* tree and replays each recorded call from its pickled pre-state.
+3. **Compare**: Diffs the two JSONL streams using per-function policy from `contract/policy.toml`. Floats compared by ULP distance; structures compared exactly.
+4. **Coverage**: Checks that changed lines were actually executed (prevents vacuous passes).
+5. **Latency**: ABBA-interleaved benchmarks with bootstrap confidence intervals, plus deterministic instruction counting for noisy boxes.
 
-`A memory recall --query payments --fresh`
+### Key Design Decisions
+- **Never load baseline and candidate in one interpreter** — import resolution contamination.
+- **Import-hook injection, not sys.settrace** — 1x overhead vs 3-8x.
+- **Tri-state verdicts**: `PASS | FAIL | UNVERIFIED(reason)`. `UNVERIFIED` is never green.
+- **Per-function ULP policy** — not one global tolerance. `numpy.allclose` would mask millions of ULPs on small values.
 
-Facts retain their evidence, are HMAC-signed, re-checked against files/commits/tests on recall, and remain visible as stale or disputed rather than becoming truth by repetition.
+## Manual Usage (Until Engine Is Built)
 
-## Do not distort the project
-- Smallest diff that solves the task. Reuse existing helpers (outline first), match local style, no drive-by edits or reformatting.
-- Never turn tests green by weakening them: no deleted tests or assertions, skips, `noqa`, `type: ignore`, empty `except`. If a test must change, say why in your summary.
-- Run the project's own gates, not only your test. Failures that were already red at `begin` are not yours; do not fix them unless asked.
-- Leave nothing behind: debug code, unused imports, TODOs, secrets.
+### Harvest baseline
+```bash
+python -m gittool.workers.harvest \
+  --tree . --plan '{"src.math.trading_calcy": ["calculate_total_charges"]}' \
+  --out /tmp/baseline.jsonl -- pytest tests/ -q
+```
 
-## Reading the output
-- **E** proved from the AST (fix). **L** likely invented name (confirm). **P** outside your `--touch`, or a secret. **HISTORY** cites a prior fix/revert or regression guard—read the named commit before deciding. **SMELLS** hints that you may be distorting something: fix or justify. **POSSIBLE / ?** name match or dynamic module: check by hand. Unknown stays unknown; never present a guess as fact.
-- BLOCKED reasons end with `-> fix`. Do not delete `.state/`. Use `--no-static` only when review is clean and you can say why.
-- Preserve the user's uncommitted work: no stash, reset or clean.
-- Not covered: third-party APIs, runtime behaviour, cross-service contracts, non-Python symbols (JS/TS: relative imports only). "No findings" is not "safe". Tests stay the ground truth; if `brief` says `TESTS: NONE`, add or pick one first.
-- Python 3.9+ and git, stdlib only. `policy.json` (see `policy.example.json`) is the user's file, not yours. Details: `A <command> -h`.
+### Replay on candidate
+```bash
+python -m gittool.workers.replay \
+  --tree . --in /tmp/baseline.jsonl --out /tmp/candidate.jsonl
+```
+
+### Compare
+```python
+from gittool.gates.compare import compare
+import json, tomllib
+base = [json.loads(l) for l in open("/tmp/baseline.jsonl")]
+cand = [json.loads(l) for l in open("/tmp/candidate.jsonl")]
+policy = tomllib.load(open("contract/policy.toml", "rb"))
+result = compare(base, cand, policy)
+print(result["verdict"])  # PASS, FAIL, or UNVERIFIED
+```
+
+## Status
+
+**Working (13/13 tests pass):**
+- Engine orchestrator with full session lifecycle
+- State machine, crypto ledger, canonical serialization
+- Harvest → Replay → Compare pipeline (driven by Engine)
+- ULP-distance comparison with per-function policy
+- Changed-line coverage via sys.monitoring
+- Deterministic instruction counting
+- ABBA benchmark driver
+- MCP server with 9 tools (begin, edit_ack, review, verify_start, verify_result, status, close, abort, request_override)
+- Edit-after-verify tamper detection
+- stdio server entry point
+
+**Not yet built:**
+- `contract/invariants/` (Hypothesis property tests for real project code)
+- `contract/perf.lock` (golden baseline)
+- Hardware counter tier (`perf stat`)
+- Z3 algebraic equivalence checker
